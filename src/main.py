@@ -22,7 +22,7 @@ from src.application.commands import (
     CrearCotizacionCommand, 
     AutorizarCreditoCommand
 )
-from src.domain.models import Cotizacion, Credito, Inventario, Pedido, Venta
+from src.domain.models import Cotizacion, Credito, Inventario, Pedido, Venta, Actor
 from src.application.services import (
     VentaApplicationService,
     ValidacionApplicationService,
@@ -181,6 +181,95 @@ for cot in COTIZACIONES_DEMO:
 _contador_ventas = 1000
 HISTORIAL_VENTAS = []
 
+# ----------------------------------------------------------------------------
+# CARTERA Y REGISTRO DE CLIENTES COMERCIALES (FerreMax CRM & DDD)
+# ----------------------------------------------------------------------------
+CLIENTES_REGISTRY = [
+    {
+        "id": "FER-C001",
+        "nombre": "Constructora Regia S.A. de C.V.",
+        "rfc": "CRE850315XX1",
+        "tipo": "EMPRESARIAL",
+        "es_preferente": True,
+        "activo": True,
+        "ciudad": "Monterrey",
+        "telefono": "81-8340-2020",
+        "limite_credito": 50000.0,
+        "saldo_utilizado": 12400.0,
+    },
+    {
+        "id": "FER-C002",
+        "nombre": "Obras y Acabados del Norte",
+        "rfc": "OAN920810AB2",
+        "tipo": "CONTRATISTA",
+        "es_preferente": False,
+        "activo": True,
+        "ciudad": "Apodaca",
+        "telefono": "81-8311-5500",
+        "limite_credito": 25000.0,
+        "saldo_utilizado": 8750.0,
+    },
+    {
+        "id": "FER-C003",
+        "nombre": "Juan Pérez (Contratista Independiente)",
+        "rfc": "PEPJ780415M12",
+        "tipo": "CONTRATISTA",
+        "es_preferente": False,
+        "activo": True,
+        "ciudad": "Monterrey",
+        "telefono": "81-2233-4455",
+        "limite_credito": 10000.0,
+        "saldo_utilizado": 9500.0,
+    },
+    {
+        "id": "FER-C005",
+        "nombre": "Ferretería y Edificaciones El Roble",
+        "rfc": "FER010203RO1",
+        "tipo": "DISTRIBUIDOR",
+        "es_preferente": True,
+        "activo": True,
+        "ciudad": "San Pedro Garza García",
+        "telefono": "81-8899-7711",
+        "limite_credito": 100000.0,
+        "saldo_utilizado": 15000.0,
+    },
+    {
+        "id": "FER-C007",
+        "nombre": "Desarrollos Urbanos del Valle (Suspendido)",
+        "rfc": "DUV991120XY9",
+        "tipo": "EMPRESARIAL",
+        "es_preferente": False,
+        "activo": False,
+        "ciudad": "Monterrey",
+        "telefono": "81-8100-9900",
+        "limite_credito": 30000.0,
+        "saldo_utilizado": 30000.0,
+    },
+    {
+        "id": "FER-C008",
+        "nombre": "Instalaciones Eléctricas de Apodaca",
+        "rfc": "IEA880620KL3",
+        "tipo": "CONTRATISTA",
+        "es_preferente": False,
+        "activo": True,
+        "ciudad": "Apodaca",
+        "telefono": "81-8386-1122",
+        "limite_credito": 20000.0,
+        "saldo_utilizado": 4200.0,
+    },
+]
+
+class ClienteCreateRequest(BaseModel):
+    nombre: str
+    rfc: Optional[str] = "XAXX010101000"
+    tipo: Optional[str] = "EMPRESARIAL"
+    es_preferente: bool = False
+    activo: bool = True
+    ciudad: str = "Monterrey"
+    telefono: Optional[str] = "81-1234-5678"
+    limite_credito: float = 15000.0
+
+
 
 # ----------------------------------------------------------------------------
 # ENDPOINTS REST EXISTENTES (CONSERVADOS DEL COMMIT DEL EQUIPO)
@@ -212,6 +301,8 @@ def autorizar_credito(comando: AutorizarCreditoCommand):
 class VentaRequest(BaseModel):
     producto_id: int
     cantidad: int
+    cliente_id: Optional[str] = "PUBLICO"
+
 
 class ValidarCreditoRequest(BaseModel):
     id_cotizacion: int
@@ -255,7 +346,10 @@ def listar_productos():
 def procesar_venta(req: VentaRequest):
     """
     CU-01: Procesa una venta en mostrador usando VentaApplicationService.
-    Descuenta inventario y confirma transacción en Unit of Work.
+    Aplica reglas de negocio:
+    - Regla 1 (Specification): Valida que el cliente esté activo.
+    - Regla 2 (Specification): Aplica descuento VIP si compra >= $1,500 MXN.
+    - Descuenta inventario físico y confirma transacción en Unit of Work.
     """
     global _contador_ventas
     producto = next((p for p in PRODUCTOS if p["id"] == req.producto_id), None)
@@ -265,6 +359,27 @@ def procesar_venta(req: VentaRequest):
     if req.cantidad <= 0:
         raise HTTPException(status_code=400, detail="La cantidad debe ser mayor a cero")
 
+    # Identificar cliente asignado a la venta
+    cliente_info = None
+    cliente_nombre = "Público en General"
+    es_vip = False
+    if req.cliente_id and req.cliente_id != "PUBLICO":
+        cliente_info = next((c for c in CLIENTES_REGISTRY if c["id"] == req.cliente_id), None)
+        if cliente_info:
+            cliente_nombre = cliente_info["nombre"]
+            es_vip = cliente_info.get("es_preferente", False)
+
+            # REGLA 1 (Specification Pattern): ActorActivo
+            if not cliente_info.get("activo", True):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "mensaje": f"⛔ OPERACIÓN RECHAZADA: El cliente '{cliente_nombre}' se encuentra INACTIVO / SUSPENDIDO.",
+                        "detalle": "Especificación de Dominio (PuedeProcesarseSpecification): Se requiere ActorActivo=Verdadero.",
+                        "disponible": producto["inventario"].existencia - producto["inventario"].comprometido
+                    }
+                )
+
     inventario = producto["inventario"]
     _contador_ventas += 1
     id_venta = _contador_ventas
@@ -272,7 +387,19 @@ def procesar_venta(req: VentaRequest):
 
     try:
         resultado = venta_service.procesar_venta_mostrador(venta, inventario, req.cantidad)
-        total = round(producto["precio"] * req.cantidad, 2)
+        subtotal = round(producto["precio"] * req.cantidad, 2)
+
+        # REGLA 2 (Specification Pattern): Beneficio Preferente VIP si compra >= $1,500 MXN
+        descuento_vip = 0.0
+        mensaje_regla = "Precio regular de mostrador"
+        if es_vip and subtotal >= 1500.0:
+            descuento_vip = round(subtotal * 0.10, 2)  # 10% Descuento Preferente
+            mensaje_regla = "⭐ Aplica Beneficio VIP (10% de descuento por compra >= $1,500 MXN)"
+        elif es_vip:
+            mensaje_regla = "Cliente VIP registrado (El descuento requiere compra mínima de $1,500 MXN)"
+
+        total = round(subtotal - descuento_vip, 2)
+
         ticket = {
             "folio": f"VTA-{id_venta}",
             "fecha": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
@@ -280,7 +407,13 @@ def procesar_venta(req: VentaRequest):
             "codigo": producto["codigo"],
             "precio_unitario": producto["precio"],
             "cantidad": req.cantidad,
+            "subtotal": subtotal,
+            "descuento_vip": descuento_vip,
             "total": total,
+            "cliente_id": req.cliente_id or "PUBLICO",
+            "cliente": cliente_nombre,
+            "es_vip": es_vip,
+            "regla_aplicada": mensaje_regla,
             "estado": venta.estado,
             "stock_restante": inventario.existencia,
             "mensaje": resultado,
@@ -301,6 +434,108 @@ def procesar_venta(req: VentaRequest):
                 "disponible": disponible,
             }
         )
+
+
+# ----------------------------------------------------------------------------
+# ENDPOINTS GESTIÓN DE CLIENTES / CARTERA
+# ----------------------------------------------------------------------------
+@app.get("/api/clientes", tags=["Clientes"])
+def listar_clientes():
+    """Retorna la lista de clientes registrados con su crédito disponible y estado."""
+    for c in CLIENTES_REGISTRY:
+        c["credito_disponible"] = max(0.0, round(c["limite_credito"] - c.get("saldo_utilizado", 0.0), 2))
+    return {
+        "ok": True,
+        "total": len(CLIENTES_REGISTRY),
+        "clientes": CLIENTES_REGISTRY
+    }
+
+
+@app.post("/api/clientes", tags=["Clientes"], status_code=status.HTTP_201_CREATED)
+def registrar_cliente(req: ClienteCreateRequest):
+    """
+    Registra un nuevo cliente/actor en la cartera comercial de FerreMax.
+    Se sincroniza con el modelo de Dominio (Actor) y la máquina de especificaciones.
+    """
+    nombre_limpio = req.nombre.strip()
+    if not nombre_limpio:
+        raise HTTPException(status_code=400, detail="El nombre del cliente no puede estar vacío")
+
+    # Generar folio consecutivo
+    num_id = len(CLIENTES_REGISTRY) + 1
+    nuevo_id = f"FER-C{num_id:03d}"
+
+    nuevo_cliente = {
+        "id": nuevo_id,
+        "nombre": nombre_limpio,
+        "rfc": req.rfc.strip().upper() if req.rfc else "XAXX010101000",
+        "tipo": req.tipo.strip().upper() if req.tipo else "EMPRESARIAL",
+        "es_preferente": bool(req.es_preferente),
+        "activo": bool(req.activo),
+        "ciudad": req.ciudad.strip() if req.ciudad else "Monterrey",
+        "telefono": req.telefono.strip() if req.telefono else "81-0000-0000",
+        "limite_credito": float(req.limite_credito),
+        "saldo_utilizado": 0.0,
+        "credito_disponible": float(req.limite_credito),
+    }
+    CLIENTES_REGISTRY.append(nuevo_cliente)
+
+    # Registrar en el Evaluador de Dominio (para compatibilidad con tests y especificaciones)
+    try:
+        actor_dominio = Actor(
+            actor_id=nuevo_id,
+            nombre=nombre_limpio,
+            es_preferente=bool(req.es_preferente),
+            activo=bool(req.activo),
+            ciudad=req.ciudad.strip() if req.ciudad else "Monterrey"
+        )
+        evaluador_docente.actores[nuevo_id] = actor_dominio
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "mensaje": f"¡Cliente '{nombre_limpio}' registrado con éxito en la cartera!",
+        "cliente": nuevo_cliente
+    }
+
+
+@app.put("/api/clientes/{cliente_id}/toggle-activo", tags=["Clientes"])
+def alternar_estado_cliente(cliente_id: str):
+    """Alterna el estado Activo / Inactivo del cliente para validar la Regla 1 (Specification)."""
+    cliente = next((c for c in CLIENTES_REGISTRY if c["id"] == cliente_id), None)
+    if not cliente:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+    cliente["activo"] = not cliente["activo"]
+    if cliente_id in evaluador_docente.actores:
+        evaluador_docente.actores[cliente_id].activo = cliente["activo"]
+
+    estado_str = "ACTIVO" if cliente["activo"] else "INACTIVO / SUSPENDIDO"
+    return {
+        "ok": True,
+        "mensaje": f"Estado de {cliente['nombre']} actualizado a {estado_str}",
+        "activo": cliente["activo"]
+    }
+
+
+@app.put("/api/clientes/{cliente_id}/toggle-vip", tags=["Clientes"])
+def alternar_vip_cliente(cliente_id: str):
+    """Alterna el estado Preferente (VIP) para validar la Regla 2 (Specification)."""
+    cliente = next((c for c in CLIENTES_REGISTRY if c["id"] == cliente_id), None)
+    if not cliente:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+    cliente["es_preferente"] = not cliente["es_preferente"]
+    if cliente_id in evaluador_docente.actores:
+        evaluador_docente.actores[cliente_id].es_preferente = cliente["es_preferente"]
+
+    vip_str = "VIP / PREFERENTE" if cliente["es_preferente"] else "ESTÁNDAR"
+    return {
+        "ok": True,
+        "mensaje": f"Categoría de {cliente['nombre']} actualizada a {vip_str}",
+        "es_preferente": cliente["es_preferente"]
+    }
 
 
 @app.get("/api/cotizaciones", tags=["Créditos"])
